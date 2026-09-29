@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+import webbrowser
+
+ROOT = Path(__file__).resolve().parent
+DB_PATH = ROOT / "support.db"
+STATIC_PATH = ROOT / "static"
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def connect() -> sqlite3.Connection:
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
+
+
+def initialize() -> None:
+    with connect() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS customers (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
+                company TEXT NOT NULL DEFAULT '', plan TEXT NOT NULL DEFAULT 'Standard',
+                locale TEXT NOT NULL DEFAULT 'en', created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, role TEXT NOT NULL,
+                skills TEXT NOT NULL DEFAULT '[]', languages TEXT NOT NULL DEFAULT '["en"]',
+                tier INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'Available',
+                is_ai INTEGER NOT NULL DEFAULT 0, max_concurrent INTEGER NOT NULL DEFAULT 5,
+                persona TEXT NOT NULL DEFAULT 'Helpful and clear', system_prompt TEXT NOT NULL DEFAULT '',
+                guardrails TEXT NOT NULL DEFAULT '', shift_start TEXT NOT NULL DEFAULT '09:00',
+                shift_end TEXT NOT NULL DEFAULT '17:00', permissions TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS tickets (
+                id TEXT PRIMARY KEY, customer_id TEXT NOT NULL REFERENCES customers(id),
+                subject TEXT NOT NULL, channel TEXT NOT NULL, status TEXT NOT NULL,
+                priority TEXT NOT NULL, category TEXT NOT NULL, language TEXT NOT NULL DEFAULT 'en',
+                assigned_agent_id TEXT REFERENCES agents(id), created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, first_response_seconds INTEGER,
+                csat INTEGER, resolved_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ticket_id TEXT NOT NULL REFERENCES tickets(id),
+                sender TEXT NOT NULL, body TEXT NOT NULL, created_at TEXT NOT NULL,
+                is_internal INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_tickets_customer ON tickets(customer_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tickets_queue ON tickets(status, priority, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
+            CREATE TABLE IF NOT EXISTS customer_memory (
+                customer_id TEXT PRIMARY KEY REFERENCES customers(id) ON DELETE CASCADE,
+                summary TEXT NOT NULL DEFAULT '', environment TEXT NOT NULL DEFAULT '{}',
+                known_issues TEXT NOT NULL DEFAULT '[]', successful_resolutions TEXT NOT NULL DEFAULT '[]',
+                sentiment_score INTEGER NOT NULL DEFAULT 0, frustration_level TEXT NOT NULL DEFAULT 'Low',
+                visible_to_customer INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS memory_search USING fts5(
+                customer_id UNINDEXED, content, tokenize='unicode61'
+            );
+            CREATE TABLE IF NOT EXISTS training_documents (
+                id TEXT PRIMARY KEY, filename TEXT NOT NULL, content TEXT NOT NULL,
+                uploaded_by TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_search USING fts5(
+                document_id UNINDEXED, content, tokenize='unicode61'
+            );
+            """
+        )
+        agent_columns = {row[1] for row in db.execute("PRAGMA table_info(agents)")}
+        migrations = {
+            "persona": "TEXT NOT NULL DEFAULT 'Helpful and clear'",
+            "system_prompt": "TEXT NOT NULL DEFAULT ''",
+            "guardrails": "TEXT NOT NULL DEFAULT ''",
+            "shift_start": "TEXT NOT NULL DEFAULT '09:00'",
+            "shift_end": "TEXT NOT NULL DEFAULT '17:00'",
+            "permissions": "TEXT NOT NULL DEFAULT '[]'",
+        }
+        for column, definition in migrations.items():
+            if column not in agent_columns:
+                db.execute(f"ALTER TABLE agents ADD COLUMN {column} {definition}")
+        if db.execute("SELECT COUNT(*) FROM customers").fetchone()[0]:
+            return
+        stamp = now()
+        customers = [
+            ("cus-1042", "Maya Chen", "maya.chen@northstar.io", "Northstar Studio", "Enterprise", "en", stamp),
+            ("cus-1043", "Jordan Ellis", "jordan@fieldnotes.co", "Fieldnotes", "Pro", "en", stamp),
+            ("cus-1044", "Amara Okafor", "amara@daybreak.health", "Daybreak Health", "Enterprise", "en", stamp),
+            ("cus-1045", "Theo Martin", "theo@atelier-m.fr", "Atelier M", "Pro", "fr", stamp),
+            ("cus-1046", "Priya Nair", "priya@openledger.com", "OpenLedger", "Standard", "en", stamp),
+        ]
+        db.executemany("INSERT INTO customers VALUES (?, ?, ?, ?, ?, ?, ?)", customers)
+        agents = [
+            ("agt-01", "Alex Morgan", "Senior support", '["billing", "api", "technical"]', '["en", "fr"]', 2, "Available", 0, 8),
+            ("agt-02", "Sam Rivera", "Support specialist", '["integrations", "onboarding", "technical"]', '["en", "es"]', 1, "Busy", 0, 6),
+            ("agt-03", "Nia Patel", "AI assistant", '["billing", "account", "technical", "integrations"]', '["en", "fr", "es"]', 1, "Available", 1, 20),
+            ("agt-04", "Luca Bernard", "Escalations", '["api", "security", "technical"]', '["en", "fr"]', 3, "Available", 0, 5),
+        ]
+        db.executemany("INSERT INTO agents(id, name, role, skills, languages, tier, status, is_ai, max_concurrent) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", agents)
+        ticket_rows = [
+            ("CS-2841", "cus-1042", "Webhook events are arriving out of order", "Chat", "Open", "Urgent", "API", "en", "agt-01", stamp, stamp, 148, None, None),
+            ("CS-2838", "cus-1043", "Two-factor code never arrives", "Email", "Open", "High", "Account", "en", "agt-02", stamp, stamp, 623, None, None),
+            ("CS-2832", "cus-1044", "Export shows yesterday's data", "Chat", "Pending", "Normal", "Data & exports", "en", "agt-03", stamp, stamp, 96, None, None),
+            ("CS-2826", "cus-1045", "Facture du mois de juin", "Email", "Open", "Normal", "Billing", "fr", "agt-01", stamp, stamp, None, None, None),
+            ("CS-2821", "cus-1046", "SCIM sync paused after update", "Social", "Open", "High", "Integrations", "en", "agt-02", stamp, stamp, 312, None, None),
+            ("CS-2819", "cus-1042", "Dashboard takes a long time to load", "Phone", "Resolved", "Normal", "Performance", "en", "agt-01", stamp, stamp, 81, 5, stamp),
+            ("CS-2815", "cus-1043", "How do I add another workspace?", "Chat", "Resolved", "Low", "Onboarding", "en", "agt-03", stamp, stamp, 43, 4, stamp),
+        ]
+        db.executemany("INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", ticket_rows)
+        messages = [
+            ("CS-2841", "Maya Chen", "We changed our event consumer yesterday and now order.created arrives after order.updated. This is affecting our production sync.", stamp, 0),
+            ("CS-2841", "Alex Morgan", "I can see why that would block a production sync. I’m checking the delivery attempts and your endpoint configuration now.", stamp, 0),
+            ("CS-2838", "Jordan Ellis", "I have tried three times and still have no code. I need to get into my account before my team starts.", stamp, 0),
+            ("CS-2832", "Amara Okafor", "The export is one day behind even after I refresh it. Is this expected?", stamp, 0),
+            ("CS-2826", "Theo Martin", "Bonjour, pourriez-vous m'envoyer la facture de juin ?", stamp, 0),
+            ("CS-2821", "Priya Nair", "Our SCIM directory sync stopped right after the connector update. We need this working today.", stamp, 0),
+            ("CS-2819", "Maya Chen", "The dashboard is much faster now, thanks for sticking with this.", stamp, 0),
+            ("CS-2815", "Jordan Ellis", "That did it, thank you!", stamp, 0),
+        ]
+        db.executemany("INSERT INTO messages(ticket_id, sender, body, created_at, is_internal) VALUES (?, ?, ?, ?, ?)", messages)
+        memories = [
+            ("cus-1042", "Production customer. Prefers concise technical updates and a clear next checkpoint. Previously affected by slow dashboards; keep the webhook investigation with a senior API specialist.", '{"platform":"AWS","browser":"Chrome 128","sdk":"Node.js 4.2","timezone":"America/Los_Angeles"}', '["Webhook event ordering after consumer changes","Dashboard performance under large workspaces"]', '["Raised dashboard cache limit; confirmed improvement on CS-2819"]', 68, "Elevated", 1, stamp),
+            ("cus-1043", "Prefers email follow-up. Has a deadline before the team starts each morning. Verified backup codes restored access successfully last time.", '{"platform":"macOS 15","browser":"Safari 18","timezone":"America/New_York"}', '["SMS delivery to corporate carrier","Two-factor setup"]', '["Used backup codes, then re-enrolled authenticator"]', 52, "Moderate", 1, stamp),
+            ("cus-1044", "Values precise data freshness explanations. Usually works from the reporting workspace and validates exports against the dashboard.", '{"platform":"Windows 11","browser":"Edge 128","timezone":"Africa/Lagos"}', '["Export freshness and timezone boundaries"]', '["Rebuilt the export after the daily warehouse refresh"]', 24, "Low", 1, stamp),
+            ("cus-1045", "French is preferred. Keep billing explanations polite and send invoices as PDF attachments.", '{"platform":"macOS 14","browser":"Chrome 127","timezone":"Europe/Paris"}', '["Monthly invoice delivery"]', '["Resent PDF invoice to billing contact"]', 15, "Low", 1, stamp),
+            ("cus-1046", "Production identity sync. Coordinate connector changes before suggesting a reset; changes affect the entire directory.", '{"platform":"Ubuntu 24.04","integration":"Okta SCIM","timezone":"Asia/Kolkata"}', '["SCIM provisioning pauses after connector updates"]', '["Rotated token and replayed failed provisioning queue"]', 76, "Elevated", 1, stamp),
+        ]
+        db.executemany("INSERT INTO customer_memory VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", memories)
+        db.execute("INSERT INTO memory_search(customer_id, content) SELECT customer_id, summary || ' ' || known_issues || ' ' || successful_resolutions FROM customer_memory")
+
+
+def json_list(value: str) -> list:
+    try:
+        return json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return []
+
+
+def ticket_detail(db: sqlite3.Connection, ticket_id: str) -> dict | None:
+    row = db.execute(
+        """SELECT t.*, c.name customer_name, c.email customer_email, c.company, c.plan,
+                  a.name agent_name, m.summary memory_summary, m.environment, m.known_issues,
+                  m.successful_resolutions, m.sentiment_score, m.frustration_level,
+                  m.visible_to_customer, m.updated_at memory_updated_at
+           FROM tickets t JOIN customers c ON c.id=t.customer_id
+           LEFT JOIN agents a ON a.id=t.assigned_agent_id
+           LEFT JOIN customer_memory m ON m.customer_id=c.id WHERE t.id=?""",
+        (ticket_id,),
+    ).fetchone()
+    if not row:
+        return None
+    result = dict(row)
+    result["environment"] = json.loads(result["environment"] or "{}")
+    result["known_issues"] = json_list(result["known_issues"])
+    result["successful_resolutions"] = json_list(result["successful_resolutions"])
+    result["messages"] = [dict(item) for item in db.execute(
+        "SELECT id, sender, body, created_at, is_internal FROM messages WHERE ticket_id=? ORDER BY id", (ticket_id,)
+    )]
+    return result
+
+
+def load_ticket_detail(ticket_id: str) -> dict | None:
+    with connect() as db:
+        return ticket_detail(db, ticket_id)
+
+
+def bootstrap() -> dict:
+    with connect() as db:
+        tickets = [ticket_detail(db, row[0]) for row in db.execute("SELECT id FROM tickets ORDER BY CASE priority WHEN 'Urgent' THEN 0 WHEN 'High' THEN 1 WHEN 'Normal' THEN 2 ELSE 3 END, updated_at DESC")]
+        agents = []
+        for row in db.execute("SELECT * FROM agents ORDER BY is_ai, name"):
+            agent = dict(row)
+            agent["skills"] = json_list(agent["skills"])
+            agent["languages"] = json_list(agent["languages"])
+            agent["permissions"] = json_list(agent["permissions"])
+            agent["open_tickets"] = db.execute("SELECT COUNT(*) FROM tickets WHERE assigned_agent_id=? AND status IN ('Open','Pending')", (agent["id"],)).fetchone()[0]
+            agents.append(agent)
+        open_count = sum(1 for ticket in tickets if ticket["status"] in ("Open", "Pending"))
+        documents = [dict(row) for row in db.execute("SELECT id, filename, uploaded_by, created_at FROM training_documents ORDER BY created_at DESC")]
+        return {"tickets": tickets, "agents": agents, "documents": documents, "metrics": {"open": open_count, "urgent": sum(1 for t in tickets if t["priority"] == "Urgent" and t["status"] == "Open"), "avg_first_response_minutes": 4.8, "csat": 96}}
+
+
+def retrieve_memory(customer_id: str, query: str) -> dict | None:
+    with connect() as db:
+        customer = db.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+        row = db.execute("SELECT * FROM customer_memory WHERE customer_id=?", (customer_id,)).fetchone()
+        if not customer or not row:
+            return None
+        stop_words = {"the", "and", "for", "with", "this", "that", "from", "have", "does", "your", "you", "are", "was", "our", "into", "after", "before"}
+        terms = [term.lower() for term in re.findall(r"[\w'-]+", query) if len(term) > 2 and term.lower() not in stop_words]
+        content = " ".join([row["summary"], *json_list(row["known_issues"]), *json_list(row["successful_resolutions"]) ]).lower()
+        matched = [term for term in terms if term in content]
+        history = [dict(item) for item in db.execute(
+            """SELECT t.id, t.subject, t.status, t.category, t.resolved_at, m.body, m.sender
+               FROM tickets t LEFT JOIN messages m ON m.id=(SELECT id FROM messages WHERE ticket_id=t.id ORDER BY id DESC LIMIT 1)
+               WHERE t.customer_id=? ORDER BY t.updated_at DESC LIMIT 8""", (customer_id,)
+        )]
+        return {
+            "customer_id": customer_id,
+            "customer_name": customer["name"],
+            "summary": row["summary"],
+            "environment": json.loads(row["environment"] or "{}"),
+            "known_issues": json_list(row["known_issues"]),
+            "successful_resolutions": json_list(row["successful_resolutions"]),
+            "sentiment_score": row["sentiment_score"],
+            "frustration_level": row["frustration_level"],
+            "visible_to_customer": bool(row["visible_to_customer"]),
+            "matched_terms": matched,
+            "history": history,
+        }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "SupportMemory/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"{self.client_address[0]} - {fmt % args}")
+
+    def send_json(self, payload: object, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 1_000_000:
+            raise ValueError("Request body too large")
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/api/bootstrap":
+            self.send_json(bootstrap())
+            return
+        if path == "/api/health":
+            self.send_json({"ok": True, "storage": "sqlite"})
+            return
+        if path == "/api/knowledge":
+            with connect() as db:
+                documents = [dict(row) for row in db.execute("SELECT id, filename, uploaded_by, created_at FROM training_documents ORDER BY created_at DESC")]
+            self.send_json({"documents": documents})
+            return
+        match = re.fullmatch(r"/api/portal/customers/([^/]+)/memory", path)
+        if match:
+            memory = retrieve_memory(match.group(1), "")
+            if not memory:
+                self.send_json({"error": "Customer not found"}, 404)
+            elif not memory["visible_to_customer"]:
+                self.send_json({"error": "Customer memory is not shared"}, 403)
+            else:
+                self.send_json({key: memory[key] for key in ("customer_id", "customer_name", "summary", "environment", "known_issues", "successful_resolutions")})
+            return
+        match = re.fullmatch(r"/api/customers/([^/]+)/memory", path)
+        if match:
+            memory = retrieve_memory(match.group(1), "")
+            self.send_json(memory or {"error": "Customer not found"}, 200 if memory else 404)
+            return
+        if path == "/api/memory/search":
+            params = parse_qs(parsed.query)
+            customer_id = params.get("customer_id", [""])[0]
+            query = params.get("q", [""])[0]
+            memory = retrieve_memory(customer_id, query)
+            self.send_json(memory or {"error": "Customer not found"}, 200 if memory else 404)
+            return
+        if path.startswith("/api/"):
+            self.send_json({"error": "Not found"}, 404)
+            return
+        requested = STATIC_PATH / ("home.html" if path == "/" else path.lstrip("/"))
+        try:
+            resolved = requested.resolve()
+            resolved.relative_to(STATIC_PATH.resolve())
+            data = resolved.read_bytes()
+        except (OSError, ValueError):
+            self.send_json({"error": "Not found"}, 404)
+            return
+        content_types = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8"}
+        content_type = content_types.get(resolved.suffix, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path.rstrip("/")
+        try:
+            body = self.read_json()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json({"error": str(error)}, 400)
+            return
+        if path == "/api/tickets":
+            subject = str(body.get("subject", "")).strip()[:240]
+            message = str(body.get("message", "")).strip()[:10000]
+            customer_id = str(body.get("customer_id", ""))
+            channel = body.get("channel", "Chat")
+            priority = body.get("priority", "Normal")
+            if not subject or not message or channel not in ("Chat", "Email", "Phone", "Social") or priority not in ("Low", "Normal", "High", "Urgent"):
+                self.send_json({"error": "Subject, message, channel, or priority is invalid"}, 400)
+                return
+            with connect() as db:
+                customer = db.execute("SELECT name, locale FROM customers WHERE id=?", (customer_id,)).fetchone()
+                if not customer:
+                    self.send_json({"error": "Customer not found"}, 404)
+                    return
+                ticket_id = "CS-" + uuid.uuid4().hex[:6].upper()
+                stamp = now()
+                db.execute("INSERT INTO tickets(id, customer_id, subject, channel, status, priority, category, language, assigned_agent_id, created_at, updated_at) VALUES (?, ?, ?, ?, 'Open', ?, ?, ?, NULL, ?, ?)", (ticket_id, customer_id, subject, channel, priority, str(body.get("category", "General"))[:80], str(body.get("language", customer["locale"]))[:12], stamp, stamp))
+                db.execute("INSERT INTO messages(ticket_id, sender, body, created_at) VALUES (?, ?, ?, ?)", (ticket_id, customer["name"], message, stamp))
+            self.send_json({"ticket": load_ticket_detail(ticket_id)}, 201)
+            return
+        if path == "/api/agents":
+            name = str(body.get("name", "")).strip()[:100]
+            if not name:
+                self.send_json({"error": "Agent name is required"}, 400)
+                return
+            skills = body.get("skills", [])
+            languages = body.get("languages", ["en"])
+            if not isinstance(skills, list) or not isinstance(languages, list):
+                self.send_json({"error": "Skills and languages must be lists"}, 400)
+                return
+            agent_id = "agt-" + uuid.uuid4().hex[:8]
+            with connect() as db:
+                db.execute("""INSERT INTO agents(id, name, role, skills, languages, tier, status, is_ai, max_concurrent, persona, system_prompt, guardrails, shift_start, shift_end, permissions)
+                             VALUES (?, ?, ?, ?, ?, ?, 'Offline', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (agent_id, name, str(body.get("role", "Support specialist"))[:100], json.dumps(skills[:30]), json.dumps(languages[:20]), max(1, min(3, int(body.get("tier", 1)))), int(bool(body.get("is_ai"))), max(1, min(100, int(body.get("max_concurrent", 5)))), str(body.get("persona", "Helpful and clear"))[:500], str(body.get("system_prompt", ""))[:12000], str(body.get("guardrails", ""))[:4000], str(body.get("shift_start", "09:00"))[:5], str(body.get("shift_end", "17:00"))[:5], json.dumps(body.get("permissions", []))))
+                agent = dict(db.execute("SELECT * FROM agents WHERE id=?", (agent_id,)).fetchone())
+            agent["skills"] = json_list(agent["skills"])
+            agent["languages"] = json_list(agent["languages"])
+            agent["permissions"] = json_list(agent["permissions"])
+            agent["open_tickets"] = 0
+            self.send_json({"agent": agent}, 201)
+            return
+        if path == "/api/knowledge":
+            filename = str(body.get("filename", "document.txt")).strip()[:180]
+            content = str(body.get("content", "")).strip()
+            if not content or len(content) > 100000:
+                self.send_json({"error": "Document text must be between 1 and 100000 characters"}, 400)
+                return
+            document_id = "doc-" + uuid.uuid4().hex[:10]
+            with connect() as db:
+                db.execute("INSERT INTO training_documents VALUES (?, ?, ?, ?, ?)", (document_id, filename, content, "Alex Morgan", now()))
+                db.execute("INSERT INTO knowledge_search(document_id, content) VALUES (?, ?)", (document_id, content))
+            self.send_json({"id": document_id, "filename": filename}, 201)
+            return
+        match = re.fullmatch(r"/api/tickets/([^/]+)/messages", path)
+        if match:
+            message = str(body.get("body", "")).strip()
+            if not message:
+                self.send_json({"error": "Message is required"}, 400)
+                return
+            with connect() as db:
+                exists = db.execute("SELECT 1 FROM tickets WHERE id=?", (match.group(1),)).fetchone()
+                if not exists:
+                    self.send_json({"error": "Ticket not found"}, 404)
+                    return
+                db.execute("INSERT INTO messages(ticket_id, sender, body, created_at, is_internal) VALUES (?, ?, ?, ?, ?)", (match.group(1), "Alex Morgan", message, now(), int(bool(body.get("internal")))))
+                db.execute("UPDATE tickets SET updated_at=?, status=CASE WHEN status='Pending' THEN 'Open' ELSE status END WHERE id=?", (now(), match.group(1)))
+            self.send_json({"ticket": load_ticket_detail(match.group(1))}, 201)
+            return
+        if path == "/api/route":
+            ticket_id = str(body.get("ticket_id", ""))
+            with connect() as db:
+                ticket = db.execute("SELECT * FROM tickets WHERE id=?", (ticket_id,)).fetchone()
+                if not ticket:
+                    self.send_json({"error": "Ticket not found"}, 404)
+                    return
+                candidates = []
+                for agent in db.execute("SELECT * FROM agents WHERE status='Available'"):
+                    skills = json_list(agent["skills"])
+                    languages = json_list(agent["languages"])
+                    workload = db.execute("SELECT COUNT(*) FROM tickets WHERE assigned_agent_id=? AND status IN ('Open','Pending')", (agent["id"],)).fetchone()[0]
+                    if ticket["language"] not in languages:
+                        continue
+                    if workload >= agent["max_concurrent"]:
+                        continue
+                    skill_score = int(ticket["category"].lower() in [skill.lower() for skill in skills])
+                    memory = retrieve_memory(ticket["customer_id"], ticket["subject"])
+                    tier_bonus = int(bool(memory and memory["frustration_level"] in ("Elevated", "High") and agent["tier"] >= 2))
+                    candidates.append((skill_score * 10 + tier_bonus * 5 - workload, agent["id"]))
+                if not candidates:
+                    self.send_json({"error": "No available agent matches this ticket"}, 409)
+                    return
+                candidates.sort(reverse=True)
+                selected = candidates[0][1]
+                db.execute("UPDATE tickets SET assigned_agent_id=?, updated_at=? WHERE id=?", (selected, now(), ticket_id))
+            self.send_json({"ticket": load_ticket_detail(ticket_id), "routed_to": selected})
+            return
+        self.send_json({"error": "Not found"}, 404)
+
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path.rstrip("/")
+        try:
+            body = self.read_json()
+        except (ValueError, json.JSONDecodeError) as error:
+            self.send_json({"error": str(error)}, 400)
+            return
+        match = re.fullmatch(r"/api/tickets/([^/]+)/(status|assign)", path)
+        if match:
+            ticket_id, action = match.groups()
+            with connect() as db:
+                if action == "status":
+                    status = body.get("status")
+                    if status not in ("Open", "Pending", "Resolved"):
+                        self.send_json({"error": "Invalid ticket status"}, 400)
+                        return
+                    db.execute("UPDATE tickets SET status=?, resolved_at=?, updated_at=? WHERE id=?", (status, now() if status == "Resolved" else None, now(), ticket_id))
+                else:
+                    agent_id = body.get("agent_id")
+                    if not db.execute("SELECT 1 FROM agents WHERE id=?", (agent_id,)).fetchone():
+                        self.send_json({"error": "Agent not found"}, 404)
+                        return
+                    db.execute("UPDATE tickets SET assigned_agent_id=?, updated_at=? WHERE id=?", (agent_id, now(), ticket_id))
+                if not db.execute("SELECT changes()").fetchone()[0]:
+                    self.send_json({"error": "Ticket not found"}, 404)
+                    return
+            self.send_json({"ticket": load_ticket_detail(ticket_id)})
+            return
+        match = re.fullmatch(r"/api/agents/([^/]+)/status", path)
+        if match:
+            status = body.get("status")
+            if status not in ("Available", "Busy", "Offline", "Wrap-up"):
+                self.send_json({"error": "Invalid agent status"}, 400)
+                return
+            with connect() as db:
+                db.execute("UPDATE agents SET status=? WHERE id=?", (status, match.group(1)))
+                if not db.execute("SELECT changes()").fetchone()[0]:
+                    self.send_json({"error": "Agent not found"}, 404)
+                    return
+            self.send_json({"agent_id": match.group(1), "status": status})
+            return
+        match = re.fullmatch(r"/api/agents/([^/]+)", path)
+        if match:
+            skills = body.get("skills", [])
+            languages = body.get("languages", ["en"])
+            permissions = body.get("permissions", [])
+            if not all(isinstance(value, list) for value in (skills, languages, permissions)):
+                self.send_json({"error": "Skills, languages, and permissions must be lists"}, 400)
+                return
+            with connect() as db:
+                db.execute("""UPDATE agents SET name=?, role=?, skills=?, languages=?, tier=?, max_concurrent=?, persona=?, system_prompt=?, guardrails=?, shift_start=?, shift_end=?, permissions=? WHERE id=?""",
+                           (str(body.get("name", ""))[:100], str(body.get("role", ""))[:100], json.dumps(skills[:30]), json.dumps(languages[:20]), max(1, min(3, int(body.get("tier", 1)))), max(1, min(100, int(body.get("max_concurrent", 5)))), str(body.get("persona", ""))[:500], str(body.get("system_prompt", ""))[:12000], str(body.get("guardrails", ""))[:4000], str(body.get("shift_start", "09:00"))[:5], str(body.get("shift_end", "17:00"))[:5], json.dumps(permissions), match.group(1)))
+                if not db.execute("SELECT changes()").fetchone()[0]:
+                    self.send_json({"error": "Agent not found"}, 404)
+                    return
+            self.send_json({"agent_id": match.group(1), "updated": True})
+            return
+        match = re.fullmatch(r"/api/portal/customers/([^/]+)/memory", path)
+        if match:
+            customer_id = match.group(1)
+            with connect() as db:
+                current = db.execute("SELECT visible_to_customer FROM customer_memory WHERE customer_id=?", (customer_id,)).fetchone()
+                if not current:
+                    self.send_json({"error": "Customer not found"}, 404)
+                    return
+                if not current["visible_to_customer"]:
+                    self.send_json({"error": "Customer memory is not shared"}, 403)
+                    return
+                known = body.get("known_issues", [])
+                resolutions = body.get("successful_resolutions", [])
+                environment = body.get("environment", {})
+                if not isinstance(known, list) or not isinstance(resolutions, list) or not isinstance(environment, dict):
+                    self.send_json({"error": "Memory fields have invalid types"}, 400)
+                    return
+                db.execute("UPDATE customer_memory SET summary=?, environment=?, known_issues=?, successful_resolutions=?, updated_at=? WHERE customer_id=?", (str(body.get("summary", ""))[:4000], json.dumps(environment), json.dumps(known[:50]), json.dumps(resolutions[:50]), now(), customer_id))
+                db.execute("DELETE FROM memory_search WHERE customer_id=?", (customer_id,))
+                db.execute("INSERT INTO memory_search(customer_id, content) VALUES (?, ?)", (customer_id, " ".join([str(body.get("summary", "")), *known, *resolutions])))
+            self.send_json({"customer_id": customer_id, "updated": True})
+            return
+        match = re.fullmatch(r"/api/customers/([^/]+)/memory", path)
+        if match:
+            customer_id = match.group(1)
+            with connect() as db:
+                if not db.execute("SELECT 1 FROM customers WHERE id=?", (customer_id,)).fetchone():
+                    self.send_json({"error": "Customer not found"}, 404)
+                    return
+                known = body.get("known_issues", [])
+                resolutions = body.get("successful_resolutions", [])
+                environment = body.get("environment", {})
+                score = max(0, min(100, int(body.get("sentiment_score", 0))))
+                if not isinstance(known, list) or not isinstance(resolutions, list) or not isinstance(environment, dict):
+                    self.send_json({"error": "Memory fields have invalid types"}, 400)
+                    return
+                values = (str(body.get("summary", ""))[:4000], json.dumps(environment), json.dumps(known[:50]), json.dumps(resolutions[:50]), score, str(body.get("frustration_level", "Low"))[:30], int(bool(body.get("visible_to_customer", True))), now(), customer_id)
+                db.execute("UPDATE customer_memory SET summary=?, environment=?, known_issues=?, successful_resolutions=?, sentiment_score=?, frustration_level=?, visible_to_customer=?, updated_at=? WHERE customer_id=?", values)
+                db.execute("DELETE FROM memory_search WHERE customer_id=?", (customer_id,))
+                db.execute("INSERT INTO memory_search(customer_id, content) VALUES (?, ?)", (customer_id, " ".join([values[0], *known, *resolutions])))
+            self.send_json(retrieve_memory(customer_id, ""))
+            return
+        self.send_json({"error": "Not found"}, 404)
+
+
+def main() -> None:
+    initialize()
+    host = "127.0.0.1"
+    server = None
+    for port in range(8000, 8010):
+        try:
+            server = ThreadingHTTPServer((host, port), Handler)
+            break
+        except OSError:
+            continue
+    if server is None:
+        raise OSError("No available port between 8000 and 8009")
+    url = f"http://{host}:{server.server_port}"
+    print(f"Support Memory Desk running at {url}")
+    webbrowser.open(url)
+    print("Support Memory Desk ready")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
